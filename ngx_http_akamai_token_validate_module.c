@@ -9,10 +9,10 @@
 #define TIME_CHECK_MARGIN (10)		// a margin around the token start/end time to compensate for clock differences
 
 typedef struct {
-	ngx_http_complex_value_t* token;
+	ngx_flag_t	enable;
 	ngx_str_t 	key;
+	ngx_str_t 	param_name;
 	ngx_array_t* filename_prefixes;
-	ngx_str_t	strip_token;
 } ngx_http_akamai_token_validate_loc_conf_t;
 
 enum {
@@ -25,7 +25,6 @@ typedef struct {
 	ngx_str_t st;
 	ngx_str_t exp;
 	ngx_str_t acl;
-	ngx_str_t ip;
 	
 	ngx_str_t hmac;
 	ngx_str_t signed_part;
@@ -40,7 +39,6 @@ static const ngx_http_akamai_token_field_t token_fields[] = {
 	{ ngx_string("st"), offsetof(ngx_http_akamai_token_t, st) },
 	{ ngx_string("exp"), offsetof(ngx_http_akamai_token_t, exp) },
 	{ ngx_string("acl"), offsetof(ngx_http_akamai_token_t, acl) },
-	{ ngx_string("ip"), offsetof(ngx_http_akamai_token_t, ip) },
 	{ ngx_null_string, 0 }
 };
 
@@ -53,10 +51,10 @@ static char *ngx_conf_set_hex_str_slot(ngx_conf_t *cf, ngx_command_t *cmd, void 
 
 static ngx_command_t  ngx_http_akamai_token_validate_commands[] = {
 	{ ngx_string("akamai_token_validate"),
-	NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
-	ngx_http_set_complex_value_slot,
+	NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+	ngx_conf_set_flag_slot,
 	NGX_HTTP_LOC_CONF_OFFSET,
-	offsetof(ngx_http_akamai_token_validate_loc_conf_t, token),
+	offsetof(ngx_http_akamai_token_validate_loc_conf_t, enable),
 	NULL },
 	  
 	{ ngx_string("akamai_token_validate_key"),
@@ -65,19 +63,19 @@ static ngx_command_t  ngx_http_akamai_token_validate_commands[] = {
 	NGX_HTTP_LOC_CONF_OFFSET,
 	offsetof(ngx_http_akamai_token_validate_loc_conf_t, key),
 	NULL },
+
+	{ ngx_string("akamai_token_validate_param_name"),
+	NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+	ngx_conf_set_str_slot,
+	NGX_HTTP_LOC_CONF_OFFSET,
+	offsetof(ngx_http_akamai_token_validate_loc_conf_t, param_name),
+	NULL },
 	  
 	{ ngx_string("akamai_token_validate_uri_filename_prefix"),
 	NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
 	ngx_conf_set_str_array_slot,
 	NGX_HTTP_LOC_CONF_OFFSET,
 	offsetof(ngx_http_akamai_token_validate_loc_conf_t, filename_prefixes),
-	NULL },
-
-	{ ngx_string("akamai_token_validate_strip_token"),
-	NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_FLAG,
-	ngx_conf_set_str_slot,
-	NGX_HTTP_LOC_CONF_OFFSET,
-	offsetof(ngx_http_akamai_token_validate_loc_conf_t, strip_token),
 	NULL },
 
 	ngx_null_command
@@ -134,21 +132,21 @@ ngx_conf_get_hex_char_value(int ch)
 static char *
 ngx_conf_set_hex_str_slot(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
-	ngx_str_t *field;
+    ngx_str_t *field;
 	ngx_str_t *value;
-	u_char *p;
+    u_char *p;
 	size_t i;
 	int digit1;
 	int digit2;
 
-	field = (ngx_str_t *) ((u_char*)conf + cmd->offset);
+    field = (ngx_str_t *) ((u_char*)conf + cmd->offset);
 
-	if (field->data)
+    if (field->data)
 	{
-		return "is duplicate";
-	}
+        return "is duplicate";
+    }
 
-	value = cf->args->elts;
+    value = cf->args->elts;
 
 	if (value[1].len & 0x1)
 	{
@@ -174,7 +172,7 @@ ngx_conf_set_hex_str_slot(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 	}
 	field->len = p - field->data;
 
-	return NGX_CONF_OK;
+    return NGX_CONF_OK;
 }
 
 static ngx_flag_t
@@ -257,190 +255,94 @@ ngx_http_akamai_token_validate_parse(ngx_str_t* token, ngx_http_akamai_token_t* 
 static ngx_flag_t
 ngx_http_akamai_token_validate(ngx_http_request_t *r, ngx_str_t* token, ngx_str_t* key)
 {
-	ngx_http_akamai_token_t parsed_token;
-	unsigned hash_len;
-	u_char hash[EVP_MAX_MD_SIZE];
-	u_char hash_hex[EVP_MAX_MD_SIZE * 2];
-	ngx_str_t* addr_text;
-	size_t hash_hex_len;
-	ngx_int_t value;
-#if (OPENSSL_VERSION_NUMBER < 0x10100000L)
-	HMAC_CTX hmac_buf;
-#endif
-	HMAC_CTX* hmac;
+    ngx_http_akamai_token_t parsed_token;
+    unsigned int hash_len;
+    unsigned char hash[EVP_MAX_MD_SIZE];
+    unsigned char hash_hex[EVP_MAX_MD_SIZE * 2];
+    size_t hash_hex_len;
+    ngx_int_t value;
 
-	if (!ngx_http_akamai_token_validate_parse(token, &parsed_token))
-	{
-		return 0;
-	}
-	
-	// validate the signature
-#if (OPENSSL_VERSION_NUMBER >= 0x10100000L)
-	hmac = HMAC_CTX_new();
-	if (hmac == NULL)
-	{
-		return 0;
-	}
-#else
-	hmac = &hmac_buf;
-	HMAC_CTX_init(hmac);
-#endif
-	HMAC_Init_ex(hmac, key->data, key->len, EVP_sha256(), NULL);
-	HMAC_Update(hmac, parsed_token.signed_part.data, parsed_token.signed_part.len);
+    HMAC_CTX *hmac;
 
-	// If no acl is defined include the url into the signed data
-	if (parsed_token.acl.len == 0)
-	{
-		HMAC_Update(hmac, (u_char*)"~url=", sizeof("~url=") - 1);
-		HMAC_Update(hmac, r->uri.data, r->uri.len);
-	}
+    if (!ngx_http_akamai_token_validate_parse(token, &parsed_token))
+    {
+        return 0;
+    }
 
-	HMAC_Final(hmac, hash, &hash_len);
-#if (OPENSSL_VERSION_NUMBER >= 0x10100000L)
-	HMAC_CTX_free(hmac);
-#else
-	HMAC_CTX_cleanup(hmac);
-#endif
-	hash_hex_len = ngx_hex_dump(hash_hex, hash, hash_len) - hash_hex;
-	
-	if (hash_hex_len != parsed_token.hmac.len ||
-		ngx_memcmp(hash_hex, parsed_token.hmac.data, hash_hex_len) != 0)
-	{
-		return 0;
-	}
-	
-	// validate the time
-	if (parsed_token.st.len != 0)
-	{
-		value = ngx_atoi(parsed_token.st.data, parsed_token.st.len);
-		if (value < 0) 
-		{
-			return 0;
-		}
-		
-		if (value > ngx_time() + TIME_CHECK_MARGIN)
-		{
-			return 0;
-		}
-	}
-	
-	if (parsed_token.exp.len != 0)
-	{
-		value = ngx_atoi(parsed_token.exp.data, parsed_token.exp.len);
-		if (value < 0) 
-		{
-			return 0;
-		}
-		
-		if (value + TIME_CHECK_MARGIN < ngx_time())
-		{
-			return 0;
-		}
-	}
+    // Initialize HMAC context
+    hmac = HMAC_CTX_new();
+    if (hmac == NULL)
+    {
+        return 0;
+    }
 
-	// validate the acl
-	if (parsed_token.acl.len != 0)
-	{
-		if (parsed_token.acl.data[parsed_token.acl.len - 1] == '*')
-		{
-			parsed_token.acl.len--;
-			if (r->uri.len < parsed_token.acl.len || 
-				ngx_memcmp(r->uri.data, parsed_token.acl.data, parsed_token.acl.len) != 0)
-			{
-				return 0;
-			}
-		}
-		else
-		{
-			if (r->uri.len != parsed_token.acl.len || 
-				ngx_memcmp(r->uri.data, parsed_token.acl.data, parsed_token.acl.len) != 0)
-			{
-				return 0;
-			}
-		}
-	}
-	
-	// validate the ip
-	if (parsed_token.ip.len != 0)
-	{
-		addr_text = &r->connection->addr_text;
-		if (parsed_token.ip.len != addr_text->len ||
-			ngx_memcmp(parsed_token.ip.data, addr_text->data, parsed_token.ip.len) != 0)
-		{
-			return 0;
-		}
-	}
+    // Validate the signature
+    HMAC_Init_ex(hmac, key->data, key->len, EVP_sha256(), NULL);
+    HMAC_Update(hmac, parsed_token.signed_part.data, parsed_token.signed_part.len);
+    HMAC_Final(hmac, hash, &hash_len);
+    HMAC_CTX_free(hmac);
 
-	return 1;
+    hash_hex_len = ngx_hex_dump(hash_hex, hash, hash_len) - hash_hex;
+
+    if (hash_hex_len != parsed_token.hmac.len ||
+        ngx_memcmp(hash_hex, parsed_token.hmac.data, hash_hex_len) != 0)
+    {
+        return 0;
+    }
+
+    // Validate the time
+    if (parsed_token.st.len != 0)
+    {
+        value = ngx_atoi(parsed_token.st.data, parsed_token.st.len);
+        if (value < 0)
+        {
+            return 0;
+        }
+
+        if (value > ngx_time() + TIME_CHECK_MARGIN)
+        {
+            return 0;
+        }
+    }
+
+    if (parsed_token.exp.len != 0)
+    {
+        value = ngx_atoi(parsed_token.exp.data, parsed_token.exp.len);
+        if (value < 0)
+        {
+            return 0;
+        }
+
+        if (value + TIME_CHECK_MARGIN < ngx_time())
+        {
+            return 0;
+        }
+    }
+
+    // Validate the acl
+    if (parsed_token.acl.len != 0)
+    {
+        if (parsed_token.acl.data[parsed_token.acl.len - 1] == '*')
+        {
+            parsed_token.acl.len--;
+            if (r->uri.len < parsed_token.acl.len ||
+                ngx_memcmp(r->uri.data, parsed_token.acl.data, parsed_token.acl.len) != 0)
+            {
+                return 0;
+            }
+        }
+        else
+        {
+            if (r->uri.len != parsed_token.acl.len ||
+                ngx_memcmp(r->uri.data, parsed_token.acl.data, parsed_token.acl.len) != 0)
+            {
+                return 0;
+            }
+        }
+    }
+
+    return 1;
 }
-
-static ngx_int_t
-ngx_http_akamai_token_validate_strip_arg(ngx_http_request_t *r, ngx_str_t* arg_name, ngx_str_t* arg_value)
-{
-	u_char* arg_start = arg_value->data - arg_name->len - 1;	// 1 = the equal sign
-	u_char* arg_end = arg_value->data + arg_value->len;
-	u_char* uri_end = r->unparsed_uri.data + r->unparsed_uri.len;
-	u_char* new_uri;
-	u_char* p;
-
-	// Note: this code assumes that the arg returned from ngx_http_arg points to a substring of 
-	//	of r->unparsed_uri and r->args, that is always the case according to nginx code
-	if (arg_start < r->unparsed_uri.data || arg_end > uri_end || 
-		arg_start < r->args.data || arg_end > r->args.data + r->args.len)
-	{
-		ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-			"ngx_http_akamai_token_validate_module: unexpected, token is not within unparsed_uri / args");
-		return NGX_ERROR;
-	}
-
-	new_uri = ngx_palloc(r->pool, r->unparsed_uri.len + 1);
-	if (new_uri == NULL)
-	{
-		return NGX_ERROR;
-	}
-
-	p = ngx_copy(new_uri, r->unparsed_uri.data, arg_start - r->unparsed_uri.data);
-	if (arg_end + 1 < uri_end)
-	{
-		p = ngx_copy(p, arg_end + 1, uri_end - arg_end - 1);
-	}
-
-	if (p[-1] == '?' || p[-1] == '&')
-	{
-		p--;
-	}
-
-	*p = '\0';
-
-	r->args.data = new_uri + (r->args.data - r->unparsed_uri.data);
-	if (r->args.data < p)
-	{
-		r->args.len = p - r->args.data;
-	}
-	else
-	{
-		r->args.len = 0;
-	}
-
-	r->unparsed_uri.data = new_uri;
-	r->unparsed_uri.len = p - new_uri;
-
-	return NGX_OK;
-}
-
-static void *
-ngx_http_secure_token_validate_memrchr(const u_char *s, int c, size_t n)
-{
-	const u_char *cp;
-
-	for (cp = s + n; cp > s;)
-	{
-		if (*(--cp) == (u_char)c)
-			return (void*)cp;
-	}
-	return NULL;
-}
-
 static ngx_int_t
 ngx_http_akamai_token_validate_handler(ngx_http_request_t *r)
 {
@@ -454,14 +356,14 @@ ngx_http_akamai_token_validate_handler(ngx_http_request_t *r)
 
 	conf = ngx_http_get_module_loc_conf(r, ngx_http_akamai_token_validate_module);
 
-	if (conf->token == NULL) 
+	if (!conf->enable) 
 	{
 		return NGX_OK;
 	}
 	
 	if (conf->filename_prefixes != NULL)
 	{
-		last_slash_pos = ngx_http_secure_token_validate_memrchr(r->uri.data, '/', r->uri.len);
+		last_slash_pos = memrchr(r->uri.data, '/', r->uri.len);
 		if (last_slash_pos == NULL) 
 		{
 			return NGX_HTTP_FORBIDDEN;
@@ -488,26 +390,13 @@ ngx_http_akamai_token_validate_handler(ngx_http_request_t *r)
 		}
 	}
 
-	if (ngx_http_complex_value(r, conf->token, &token) != NGX_OK)
+	if (ngx_http_arg(r, conf->param_name.data, conf->param_name.len, &token) != NGX_OK) 
 	{
-		return NGX_HTTP_INTERNAL_SERVER_ERROR;
+		return NGX_HTTP_FORBIDDEN;
 	}
-
+	
 	if (ngx_http_akamai_token_validate(r, &token, &conf->key))
 	{
-		if (conf->strip_token.len != 0)
-		{
-			if (ngx_http_arg(r, conf->strip_token.data, conf->strip_token.len, &token) != NGX_OK)
-			{
-				return NGX_HTTP_INTERNAL_SERVER_ERROR;
-			}
-
-			if (ngx_http_akamai_token_validate_strip_arg(r, &conf->strip_token, &token) != NGX_OK)
-			{
-				return NGX_HTTP_INTERNAL_SERVER_ERROR;
-			}
-		}
-
 		return NGX_OK;
 	}
 	else
@@ -527,6 +416,7 @@ ngx_http_akamai_token_validate_create_loc_conf(ngx_conf_t *cf)
 		return NGX_CONF_ERROR;
 	}
 
+    conf->enable = NGX_CONF_UNSET;
 	conf->filename_prefixes = NGX_CONF_UNSET_PTR;
 	return conf;
 }
@@ -538,13 +428,10 @@ ngx_http_akamai_token_validate_merge_loc_conf(ngx_conf_t *cf, void *parent, void
 	ngx_http_akamai_token_validate_loc_conf_t  *prev = parent;
 	ngx_http_akamai_token_validate_loc_conf_t  *conf = child;
 
-	if (conf->token == NULL)
-	{
-		conf->token = prev->token;
-	}
+	ngx_conf_merge_value(conf->enable, prev->enable, 0);
 	ngx_conf_merge_str_value(conf->key, prev->key, "");
+	ngx_conf_merge_str_value(conf->param_name, prev->param_name, "__hdnea__");
 	ngx_conf_merge_ptr_value(conf->filename_prefixes, prev->filename_prefixes, NULL);
-	ngx_conf_merge_str_value(conf->strip_token, prev->strip_token, "");
 	return NGX_CONF_OK;
 }
 
